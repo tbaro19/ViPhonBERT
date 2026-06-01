@@ -56,7 +56,7 @@ class ViPhonBertConfig(PretrainedConfig):
 
         self.special_ids = [self.pad_token_id, self.cls_token_id, self.empty_token_id, self.mask_token_id, self.unk_token_id]
 
-        self.initials = ["m", "b", "k", "v", "t", "ʝ", "d", "n", "r", "s", "ʂ", "l", "h", "f", "tʰ", "ɣ", "z", "tɕ", "ʈʂ", "ɲ", "χ", "w", "f", "z", "j", "p", "ŋ"]
+        self.initials = ["m", "b", "k", "v", "t", "ʝ", "d", "n", "r", "s", "ʂ", "l", "h", "f", "tʰ", "ɣ", "z", "tɕ", "ʈʂ", "ɲ", "χ", "w", "j", "p", "ŋ"]
         self.rhymes = ["ə̆p", "wet", "wɛw", "uəm", "ɔt", "ɛp", "ɯm", "in", "it", "et", "i", "uəj", "ɯ", "wăj", "wə̆t", "wăn", "ə̆ŋ", "aj", "ə̆m", "uj", 
                        "ɔːŋ", "ɔj", "iət", "ə̆w", "ăk", "iə", "ik̟", "wik̟", "up", "ak̟", "om", "ɛt", "iək", "um", "win", "wiət", "ɛŋ", "ut", "ɯŋ", 
                        "uət", "wam", "uk", "an", "ɯt", "uə", "ɯəp", "ə", "ɯj", "wăt", "ɛn", "ɔ", "aŋ̟", "un", "iŋ̟", "em", "uəŋ", "wek̟", "oŋ", "wɛt", 

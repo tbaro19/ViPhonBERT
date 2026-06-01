@@ -52,12 +52,21 @@ class ViPhonDataset(Dataset):
         return self.total_line
 
     def __getitem__(self, idx):
-        # the default format for the corpus file of each line if subset_<idx>.txt
-        subset_idx, line_idx = divmod(idx+1, self.LINE_PER_FILE)
+        # Tính toán index từ 0 chuẩn xác hơn
+        subset_idx = idx // self.LINE_PER_FILE
+        line_idx = idx % self.LINE_PER_FILE
+        
+        encoded_text = None 
+        
         with open(os.path.join(self.corpus_dir, f"subset_{subset_idx}.txt")) as file:
             for line_ith, text in enumerate(file):
-                if line_ith == line_idx - 1:
+                if line_ith == line_idx:
                     encoded_text = self.tokenizer(text)
                     break
 
+        # Fallback phòng trường hợp file text cuối cùng bị thiếu dòng (ngắn hơn 10.000)
+        # Giúp tránh crash DataLoader giữa chừng
+        if encoded_text is None:
+            encoded_text = self.tokenizer("<pad>") 
+            
         return encoded_text
