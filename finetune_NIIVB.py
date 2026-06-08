@@ -12,6 +12,7 @@ from torch.utils.data import TensorDataset, DataLoader, RandomSampler, Sequentia
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 from transformers import get_linear_schedule_with_warmup, BertModel
+from safetensors.torch import load_file
 
 from configs.viphon_bert_config import ViPhonBertConfig
 from vocabs.viphon_tokenizer import ViPhonTokenizer
@@ -47,8 +48,13 @@ def set_seed(seed: int):
 # 1. KIẾN TRÚC MÔ HÌNH (MODEL WRAPPER)
 # ==========================================
 class ViPhonBertForTokenClassification(nn.Module):
-    def __init__(self, config, num_labels):
-        super().__init__()
+    """
+    Kiến trúc ViPhonBERT cho bài toán Gán nhãn chuỗi (Sequence Labeling).
+    """
+    def __init__(self, config, num_labels, **kwargs):
+        pad_token_id = kwargs.pop("pad_token_id", 0) 
+    
+        super().__init__(pad_token_id=pad_token_id, **kwargs)
         self.num_labels = num_labels
         self.hidden_size = config.hidden_size
         
@@ -59,20 +65,19 @@ class ViPhonBertForTokenClassification(nn.Module):
         )
         self.fc_emb = nn.Linear(self.hidden_size * 3, self.hidden_size)
         
+        # Token Classification không cần pooled_output
         self.bert = BertModel(config, add_pooling_layer=False)
         self.bert.embeddings.word_embeddings = None
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, num_labels)
 
+        # Khởi tạo trọng số cho lớp Classifier
         self.classifier.weight.data.normal_(mean=0.0, std=config.initializer_range)
         if self.classifier.bias is not None:
             self.classifier.bias.data.zero_()
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        batch_size = input_ids.size(0)
-        seq_len = input_ids.size(1)
-
         onset_ids = input_ids[:, :, 0]
         rhyme_ids = input_ids[:, :, 1]
         tone_ids = input_ids[:, :, 2]
@@ -121,6 +126,7 @@ def load_niivtb_data(data_path):
             if not val.get("text") or not val.get("pos"):
                 continue
             examples.append({
+                "id": key,
                 "text": val["text"],
                 "pos": val["pos"]
             })
@@ -137,7 +143,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
         
         words = text.split()
         input_ids = [cls_token]
-        label_ids = [-100]
+        label_ids = [-100] # Bỏ qua token [CLS]
         
         for word in words:
             tag = pos_dict.get(word, "O")
@@ -150,6 +156,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
                     
                 l_id = LABEL_MAP.get(bio_tag, LABEL_MAP["O"])
                 
+                # Tokenize âm tiết
                 components = tokenizer.analyze(syl)
                 if components:
                     initial, rhyme, tone = components
@@ -164,15 +171,18 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
                         input_ids.append((tokenizer.config.unk_token_id,) * 3)
                         label_ids.append(l_id)
                 else:
+                    # Fallback cho từ mượn/chữ cái/dấu câu
                     for k, char in enumerate(syl):
                         input_ids.append((tokenizer.config.label2id.get(char, tokenizer.config.unk_token_id),) * 3)
-                        label_ids.append(l_id if k == 0 else -100)
+                        label_ids.append(l_id if k == 0 else -100) # Chỉ gán nhãn cho ký tự đầu tiên
         
+        # Cắt bớt nếu vượt quá max_length
         input_ids = input_ids[:max_seq_length]
         label_ids = label_ids[:max_seq_length]
         
         attention_mask = [1] * len(input_ids)
         
+        # Padding
         padding_length = max_seq_length - len(input_ids)
         if padding_length > 0:
             input_ids += [pad_token] * padding_length
@@ -222,7 +232,7 @@ def evaluate(model, dataloader, device):
 
         eval_loss += loss.mean().item()
         
-        # Tính Accuracy bỏ qua các token padding (-100)
+        # Chỉ tính accuracy trên những token hợp lệ (!= -100)
         active_mask = label_ids != -100
         active_preds = preds[active_mask]
         active_labels = label_ids[active_mask]
@@ -246,29 +256,33 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # --- KHỞI TẠO MÔ HÌNH VỚI CONFIG MẶC ĐỊNH TỪ FILE PYTHON ---
-    config = ViPhonBertConfig()
+    # --- KHỞI TẠO MODEL & TOKENIZER ---
+    logger.info(f"Loading Config từ: {args.init_checkpoint}")
+    config_path = os.path.join(args.init_checkpoint, "config.json")
+    weights_path = os.path.join(args.init_checkpoint, "model.safetensors")
+    if not os.path.exists(weights_path):
+        weights_path = os.path.join(args.init_checkpoint, "pytorch_model.bin")
+    
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    config = ViPhonBertConfig(**config_dict)
     tokenizer = ViPhonTokenizer(config) 
+    
     model = ViPhonBertForTokenClassification(config, num_labels=NUM_LABELS).to(device)
     
-    # --- LOAD TRỌNG SỐ TỪ FILE PTH TRỰC TIẾP ---
-    logger.info(f"Loading Weights từ: {args.model_weight_path}")
-    if os.path.exists(args.model_weight_path):
-        checkpoint = torch.load(args.model_weight_path, map_location=device)
-        
-        # Xử lý: Nếu bạn lưu bằng checkpoint format (có key model_state_dict) thì lấy ra
-        # Nếu lưu bằng model.state_dict() thì checkpoint chính là weights
-        if "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-            logger.info("👉 Phát hiện định dạng Training Checkpoint Dictionary.")
+    # --- LOAD TRỌNG SỐ ---
+    logger.info(f"Loading Weights từ: {weights_path}")
+    if os.path.exists(weights_path):
+        if weights_path.endswith('.safetensors'):
+            state_dict = load_file(weights_path)
         else:
-            state_dict = checkpoint
-            logger.info("👉 Phát hiện định dạng State Dict thuần túy.")
+            state_dict = torch.load(weights_path, map_location=device)
             
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        logger.info(f"Missing keys: {len(missing_keys)} (Bao gồm các layer phân loại mới khởi tạo)")
+        logger.info(f"Missing keys: {missing_keys}")
+        logger.info(f"Unexpected keys: {unexpected_keys}")
     else:
-        logger.error(f"❌ Không tìm thấy file {args.model_weight_path}. Model sẽ train bằng Random Initialization.")
+        logger.info("❌ Không tìm thấy checkpoint. Train từ Random Initialization.")
 
     # --- XỬ LÝ CACHE ---
     cache_train_path = os.path.join(args.data_dir, f"cached_niivtb_train_{args.max_seq_length}.pt")
@@ -363,7 +377,7 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True, help="Thư mục chứa train.json, dev.json")
-    parser.add_argument("--model_weight_path", type=str, required=True, help="Đường dẫn đến file .pth (Ví dụ: /network-volume/ViPhonBERT/viphon_bert_base_ep2.pth)")
+    parser.add_argument("--init_checkpoint", type=str, required=True, help="Thư mục weights gốc")
     parser.add_argument("--output_dir", type=str, default="./niivtb_outputs", help="Thư mục lưu output")
     
     parser.add_argument("--max_seq_length", type=int, default=256, help="Độ dài tối đa của câu")
