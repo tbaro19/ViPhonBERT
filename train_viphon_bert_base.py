@@ -24,12 +24,12 @@ def set_seed(seed=42):
 
 set_seed(42)
 
-BS = 64
-CHECKPOINT = "/network-volume/ViPhonBERT"
+BS = 256
+CHECKPOINT = "/network-volume/ViPhonBERT/checkpoints"
 MODEL_NAME = "viphon_bert_base"
 
 # Đổi thành True nếu muốn khôi phục và chạy tiếp từ checkpoint cũ sau khi bị ngắt quãng
-RESUME_FROM_CHECKPOINT = False 
+RESUME_FROM_CHECKPOINT = True
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -41,8 +41,8 @@ config = ViPhonBertConfig(
     hidden_act="gelu",
     hidden_dropout_prob=0.1,
     attention_probs_dropout_prob=0.1,
-    max_position_embeddings=1024,
-    max_length=1024,
+    max_position_embeddings=512,
+    max_length=512,
     type_vocab_size=1,
     is_decoder=False,
     add_cross_attention = False
@@ -71,8 +71,9 @@ dataloader = DataLoader(
 model = ViPhonBert(config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-6)
 
-total_steps = 321_435_000
-warmup_steps = int(total_steps * 0.10)
+total_steps = 3_000_000
+warmup_steps = int(total_steps * 0.01)
+warmup_steps = 0
 
 def lr_lambda(current_step):
     if current_step < warmup_steps:
@@ -108,12 +109,10 @@ if not os.path.isdir(CHECKPOINT):
     os.makedirs(CHECKPOINT, exist_ok=True)
 
 model.train()
-
-EPOCHS = total_steps // len(dataloader)
-
-for epoch in range(start_epoch, EPOCHS + 1):
+done = False
+while True:
     total_loss = 0
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}/{EPOCHS}")
+    progress_bar = tqdm(dataloader, desc=f"Epoch {start_epoch}")
 
     for batch in progress_bar:
         input_ids = batch['input_ids'].to(device)
@@ -131,7 +130,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
         scaler.update()
         
         lr_scheduler.step()
-        global_step += 1 
         
         total_loss += loss.item()
         progress_bar.set_postfix({
@@ -139,17 +137,28 @@ for epoch in range(start_epoch, EPOCHS + 1):
             'step': global_step,
             'lr': f"{lr_scheduler.get_last_lr()[0]:.2e}"
         })
-
-    torch.save({
-        "epoch": epoch + 1,  
-        "global_step": global_step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": lr_scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict()
-    }, checkpoint_path)
+        
+        global_step += 1
+        if global_step > total_steps:
+            done = True
+            break
+            
+        if global_step % 1000 == 0:
+            torch.save({
+                "epoch": start_epoch + 1,  
+                "global_step": global_step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict()
+            }, checkpoint_path)
 
     model.save_pretrained(os.path.join(CHECKPOINT, f"{MODEL_NAME}"))
 
     avg_loss = total_loss / len(dataloader)
-    print(f"Epoch {epoch} - Average Loss: {avg_loss:.4f}")
+    print(f"Epoch {start_epoch} - Average Loss: {avg_loss:.4f}")
+    
+    if done:
+        break
+    
+    start_epoch += 1
