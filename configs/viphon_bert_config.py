@@ -22,7 +22,10 @@ class ViPhonBertConfig(PretrainedConfig):
         classifier_dropout=None,
         **kwargs,
     ):
-        super().__init__(pad_token_id=0, **kwargs)
+        pad_token_id = kwargs.pop("pad_token_id", 0)
+        
+        # Gọi hàm super() với pad_token_id đã được xử lý
+        super().__init__(pad_token_id=pad_token_id, **kwargs)
 
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
