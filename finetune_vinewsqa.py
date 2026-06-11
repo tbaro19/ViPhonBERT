@@ -1,13 +1,12 @@
 import argparse
 import json
 import logging
-from logging import config
-from logging import config
 import os
 import random
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import f1_score
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
 
 import torch
 import torch.nn as nn
@@ -23,20 +22,7 @@ from vocabs.viphon_tokenizer import ViPhonTokenizer
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# THIẾT LẬP 4 NHÃN CHO VNLI (Gộp 'other' và '-')
-# ==========================================
-LABEL_MAP = {
-    "entailment": 0,
-    "neutral": 1,
-    "contradiction": 2,
-    "other": 3,
-    "-": 3       # Gộp chung các mẫu lỗi/không xác định vào nhóm 3
-}
-NUM_LABELS = len(set(LABEL_MAP.values())) # Sẽ là 4 lớp
-
 def set_seed(seed: int):
-    """Cố định seed để đảm bảo tính tái lặp"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -49,13 +35,12 @@ def set_seed(seed: int):
 
 
 # ==========================================
-# 1. KIẾN TRÚC MÔ HÌNH (SEQUENCE CLASSIFICATION)
+# 1. KIẾN TRÚC MÔ HÌNH (QUESTION ANSWERING)
 # ==========================================
-class ViPhonBertForSequenceClassification(nn.Module):
-    def __init__(self, config, num_labels):
-        super().__init__() 
-        
-        self.num_labels = num_labels
+class ViPhonBertForQuestionAnswering(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_labels = 2 
         self.hidden_size = config.hidden_size
         
         self.shared_embeddings = nn.Embedding(
@@ -68,21 +53,12 @@ class ViPhonBertForSequenceClassification(nn.Module):
         self.bert = BertModel(config, add_pooling_layer=False)
         self.bert.embeddings.word_embeddings = None
 
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Tanh(), # Giúp mô hình học các tương tác phi tuyến tính phức tạp
-            nn.Dropout(0.15), # Tăng chút dropout để chống học vẹt
-            nn.Linear(config.hidden_size, num_labels)
-        )
+        self.qa_outputs = nn.Linear(config.hidden_size, self.num_labels)
+        self.qa_outputs.weight.data.normal_(mean=0.0, std=config.initializer_range)
+        if self.qa_outputs.bias is not None:
+            self.qa_outputs.bias.data.zero_()
 
-        for module in self.classifier:
-            if isinstance(module, nn.Linear):
-                module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, start_positions=None, end_positions=None):
         onset_ids = input_ids[:, :, 0]
         rhyme_ids = input_ids[:, :, 1]
         tone_ids = input_ids[:, :, 2]
@@ -99,64 +75,58 @@ class ViPhonBertForSequenceClassification(nn.Module):
             attention_mask=attention_mask,
         )
 
-        sequence_output = outputs.last_hidden_state
-        # --- CẢI TIẾN: Dùng Mean Pooling thay vì CLS ---
-        # Tính trung bình cộng các token, bỏ qua những token là padding (attention_mask == 0)
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(sequence_output.size()).float()
-        sum_embeddings = torch.sum(sequence_output * input_mask_expanded, 1)
-        sum_mask = input_mask_expanded.sum(1)
-        sum_mask = torch.clamp(sum_mask, min=1e-9) # Tránh chia cho 0
-        mean_pooled_output = sum_embeddings / sum_mask
+        sequence_output = outputs.last_hidden_state 
         
-        # Đưa qua Dropout và Classifier
-        cls_output = self.dropout(mean_pooled_output)
-        logits = self.classifier(cls_output)
+        logits = self.qa_outputs(sequence_output) 
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous() 
+        end_logits = end_logits.squeeze(-1).contiguous()     
 
-        loss = None
-        if labels is not None:
-            # 1. Khởi tạo trọng số cho các nhãn (Class Weights)
-            # Giả định Entailment, Neutral, Contradiction có trọng số 1.0
-            # Nhãn 'other' (index 3) quá ít data -> Cấp trọng số x5 hoặc x10 để ép mô hình học
-            device = logits.device
-            weights = torch.tensor([1.0, 1.0, 1.0, 5.0]).to(device) 
-            
-            # 2. Thêm Label Smoothing = 0.1 để giảm Overfitting (Hạ mức Loss 2.6 xuống)
-            loss_fct = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        total_loss = None
+        if start_positions is not None and end_positions is not None:
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
 
-        return loss, logits
+            loss_fct = nn.CrossEntropyLoss(ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+
+        return total_loss, start_logits, end_logits
 
 
 # ==========================================
-# 2. XỬ LÝ DỮ LIỆU & CACHING
+# 2. XỬ LÝ DỮ LIỆU VINEWSQA
 # ==========================================
-def load_vnli_data(data_path):
+def load_vinewsqa_data(data_path):
     examples = []
     if not os.path.exists(data_path):
         logger.warning(f"Tệp dữ liệu không tồn tại: {data_path}")
         return examples
 
     with open(data_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-        for key, val in data.items():
-            s1 = val.get("sentence_1", "").strip()
-            s2 = val.get("sentence_2", "").strip()
-            label = val.get("label", "").strip()
-            
-            if not s1 or not s2 or not label:
-                continue
-            
-            # Đã hỗ trợ nhãn other và - nên không còn cảnh báo loại bỏ nữa
-            if label not in LABEL_MAP:
-                logger.warning(f"Nhãn lạ '{label}' hoàn toàn chưa biết. Bỏ qua.")
-                continue
-                
-            examples.append({
-                "id": key,
-                "sentence_1": s1,
-                "sentence_2": s2,
-                "label": LABEL_MAP[label]
-            })
+        dataset = json.load(f)
+        # ViNewsQA có cấu trúc root là "data"
+        data = dataset.get("data", [])
+        
+        for article in data:
+            for paragraph in article.get("paragraphs", []):
+                context = paragraph.get("context", "")
+                for qa in paragraph.get("qas", []):
+                    answer_text = ""
+                    answers = qa.get("answers", [])
+                    
+                    # Lấy câu trả lời đầu tiên làm ground truth
+                    if len(answers) > 0:
+                        answer_text = answers[0].get("text", "")
+                    
+                    examples.append({
+                        "id": qa.get("id", ""),
+                        "question": qa.get("question", ""),
+                        "context": context,
+                        "answer_text": answer_text
+                    })
     return examples
 
 def convert_examples_to_features(examples, tokenizer, max_seq_length):
@@ -164,14 +134,32 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
     features = []
     
     for example in tqdm(examples, desc="Converting features"):
-        text_pair = example["sentence_1"] + " | " + example["sentence_2"]
-        label_id = example["label"]
+        q_ids = tokenizer.encode(example["question"]).tolist() 
+        c_ids = tokenizer.encode(example["context"]).tolist()
         
-        input_ids_tensor = tokenizer.encode(text_pair) 
-        input_ids = input_ids_tensor.tolist()
-        
+        # Bỏ [CLS] của context khi nối vào sau question
+        if c_ids[0] == (tokenizer.config.cls_token_id,) * 3:
+            c_ids = c_ids[1:]
+            
+        input_ids = q_ids + c_ids
         input_ids = input_ids[:max_seq_length]
         attention_mask = [1] * len(input_ids)
+        
+        start_position = 0
+        end_position = 0
+        
+        if example["answer_text"]:
+            ans_ids = tokenizer.encode(example["answer_text"]).tolist()
+            if ans_ids[0] == (tokenizer.config.cls_token_id,) * 3:
+                ans_ids = ans_ids[1:]
+            
+            ans_len = len(ans_ids)
+            # Tìm vị trí token của câu trả lời trong chuỗi input_ids
+            for i in range(len(q_ids), len(input_ids) - ans_len + 1):
+                if input_ids[i:i+ans_len] == ans_ids:
+                    start_position = i
+                    end_position = i + ans_len - 1
+                    break
         
         padding_length = max_seq_length - len(input_ids)
         if padding_length > 0:
@@ -181,7 +169,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
         features.append({
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "label_id": label_id
+            "start_position": start_position,
+            "end_position": end_position
         })
         
     return features
@@ -189,63 +178,88 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
 def create_dataloader(features, batch_size, is_training=True):
     if not features:
         return None
+    
     all_input_ids = torch.tensor([f["input_ids"] for f in features], dtype=torch.long)
     all_attention_mask = torch.tensor([f["attention_mask"] for f in features], dtype=torch.long)
-    all_label_ids = torch.tensor([f["label_id"] for f in features], dtype=torch.long)
+    all_start_positions = torch.tensor([f["start_position"] for f in features], dtype=torch.long)
+    all_end_positions = torch.tensor([f["end_position"] for f in features], dtype=torch.long)
 
-    dataset = TensorDataset(all_input_ids, all_attention_mask, all_label_ids)
+    dataset = TensorDataset(all_input_ids, all_attention_mask, all_start_positions, all_end_positions)
     sampler = RandomSampler(dataset) if is_training else SequentialSampler(dataset)
     return DataLoader(dataset, sampler=sampler, batch_size=batch_size)
 
 
 # ==========================================
-# 3. ĐÁNH GIÁ (EVALUATION)
+# 3. ĐÁNH GIÁ (SPAN F1 VÀ EXACT MATCH)
 # ==========================================
 def evaluate(model, dataloader, device):
     if dataloader is None:
         return 0, 0, 0
-    
+        
     model.eval()
     eval_loss = 0
     nb_eval_steps = 0
     
-    all_preds = []
-    all_labels = []
+    correct_exact_match = 0
+    total_f1 = 0.0
+    total_samples = 0
 
     for batch in dataloader:
         batch = tuple(t.to(device) for t in batch)
-        input_ids, attention_mask, labels = batch
+        input_ids, attention_mask, start_positions, end_positions = batch
 
         with torch.no_grad():
-            loss, logits = model(
+            loss, start_logits, end_logits = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=labels
+                start_positions=start_positions,
+                end_positions=end_positions
             )
 
         eval_loss += loss.item()
         
-        preds = torch.argmax(logits, dim=-1).detach().cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(labels.cpu().numpy())
-        
+        start_preds = torch.argmax(start_logits, dim=-1).cpu().numpy()
+        end_preds = torch.argmax(end_logits, dim=-1).cpu().numpy()
+        start_trues = start_positions.cpu().numpy()
+        end_trues = end_positions.cpu().numpy()
+
+        for i in range(len(start_preds)):
+            sp, ep = start_preds[i], end_preds[i]
+            st, et = start_trues[i], end_trues[i]
+
+            # Exact Match
+            if sp == st and ep == et:
+                correct_exact_match += 1
+
+            # Tính F1 Score cho từng Span (Mức độ giao thoa token)
+            pred_span = set(range(sp, ep + 1)) if sp <= ep and sp > 0 else set()
+            true_span = set(range(st, et + 1)) if st <= et and st > 0 else set()
+
+            if len(pred_span) == 0 and len(true_span) == 0:
+                f1 = 1.0
+            elif len(pred_span) == 0 or len(true_span) == 0:
+                f1 = 0.0
+            else:
+                num_same = len(pred_span.intersection(true_span))
+                if num_same == 0:
+                    f1 = 0.0
+                else:
+                    precision = 1.0 * num_same / len(pred_span)
+                    recall = 1.0 * num_same / len(true_span)
+                    f1 = (2 * precision * recall) / (precision + recall)
+            
+            total_f1 += f1
+            total_samples += 1
+            
         nb_eval_steps += 1
 
     eval_loss = eval_loss / nb_eval_steps if nb_eval_steps > 0 else 0
+    exact_match_acc = correct_exact_match / total_samples if total_samples > 0 else 0
     
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
+    # avg_f1 chính là Average F1 (Macro-average F1 over examples) chuẩn của bài toán QA
+    avg_f1 = total_f1 / total_samples if total_samples > 0 else 0
     
-    accuracy = np.sum(all_preds == all_labels) / len(all_labels) if len(all_labels) > 0 else 0
-    
-    # Tính Macro F1, có thể sẽ cảnh báo UndefinedMetricWarning nếu một class không bao giờ được dự đoán
-    import warnings
-    from sklearn.exceptions import UndefinedMetricWarning
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=UndefinedMetricWarning)
-        macro_f1 = f1_score(all_labels, all_preds, average='macro') if len(all_labels) > 0 else 0
-    
-    return eval_loss, accuracy, macro_f1
+    return eval_loss, exact_match_acc, avg_f1
 
 
 # ==========================================
@@ -268,7 +282,7 @@ def train(args):
     config = ViPhonBertConfig(**config_dict)
     tokenizer = ViPhonTokenizer(config) 
     
-    model = ViPhonBertForSequenceClassification(config, num_labels=NUM_LABELS).to(device)
+    model = ViPhonBertForQuestionAnswering(config).to(device)
     
     logger.info(f"Loading Weights từ: {weights_path}")
     if os.path.exists(weights_path):
@@ -276,42 +290,45 @@ def train(args):
             state_dict = load_file(weights_path)
         else:
             state_dict = torch.load(weights_path, map_location=device)
-        missing_keys, _ = model.load_state_dict(state_dict, strict=False)
-        logger.info(f"Missing keys (do Classifier layer 4 nhãn): {missing_keys}")
+        model.load_state_dict(state_dict, strict=False)
     else:
         logger.info("❌ Không tìm thấy checkpoint. Train từ Random Initialization.")
 
-    # --- XỬ LÝ CACHE ---
-    cache_train_path = os.path.join(args.data_dir, f"cached_vnli_train_{args.max_seq_length}.pt")
-    cache_dev_path = os.path.join(args.data_dir, f"cached_vnli_dev_{args.max_seq_length}.pt")
-    cache_test_path = os.path.join(args.data_dir, f"cached_vnli_test_{args.max_seq_length}.pt")
+    # ---------------------------------------------
+    # 4.1 XỬ LÝ CACHE CHO VINEWSQA
+    # ---------------------------------------------
+    cache_train_path = os.path.join(args.data_dir, f"cached_vinewsqa_train_{args.max_seq_length}.pt")
+    cache_dev_path = os.path.join(args.data_dir, f"cached_vinewsqa_dev_{args.max_seq_length}.pt")
+    cache_test_path = os.path.join(args.data_dir, f"cached_vinewsqa_test_{args.max_seq_length}.pt")
 
     if os.path.exists(cache_train_path):
         train_features = torch.load(cache_train_path)
     else:
-        train_examples = load_vnli_data(os.path.join(args.data_dir, "train.json"))
+        train_examples = load_vinewsqa_data(os.path.join(args.data_dir, "train.json"))
         train_features = convert_examples_to_features(train_examples, tokenizer, args.max_seq_length)
         torch.save(train_features, cache_train_path)
 
     if os.path.exists(cache_dev_path):
         dev_features = torch.load(cache_dev_path)
     else:
-        dev_examples = load_vnli_data(os.path.join(args.data_dir, "dev.json"))
+        dev_examples = load_vinewsqa_data(os.path.join(args.data_dir, "dev.json"))
         dev_features = convert_examples_to_features(dev_examples, tokenizer, args.max_seq_length)
         torch.save(dev_features, cache_dev_path)
 
     if os.path.exists(cache_test_path):
         test_features = torch.load(cache_test_path)
     else:
-        test_examples = load_vnli_data(os.path.join(args.data_dir, "test.json"))
+        test_examples = load_vinewsqa_data(os.path.join(args.data_dir, "test.json"))
         test_features = convert_examples_to_features(test_examples, tokenizer, args.max_seq_length)
-        if test_features: torch.save(test_features, cache_test_path)
+        if test_features:
+            torch.save(test_features, cache_test_path)
 
     train_dataloader = create_dataloader(train_features, args.train_batch_size, is_training=True)
     dev_dataloader = create_dataloader(dev_features, args.eval_batch_size, is_training=False)
     test_dataloader = create_dataloader(test_features, args.eval_batch_size, is_training=False) if test_features else None
 
     t_total = len(train_dataloader) * args.epochs
+    
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
@@ -322,9 +339,9 @@ def train(args):
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * t_total), num_training_steps=t_total)
     scaler = GradScaler('cuda') 
 
-    logger.info("***** Bắt đầu tiến trình Huấn luyện VNLI (4 Classes) *****")
+    logger.info("***** Bắt đầu tiến trình Huấn luyện ViNewsQA *****")
     best_f1 = 0.0
-    best_model_path = os.path.join(args.output_dir, "best_model_vnli.pt")
+    best_model_path = os.path.join(args.output_dir, "best_model_vinewsqa.pt")
 
     for epoch in range(args.epochs):
         model.train()
@@ -332,15 +349,16 @@ def train(args):
         with tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{args.epochs}") as pbar:
             for batch in pbar:
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, attention_mask, labels = batch
+                input_ids, attention_mask, start_positions, end_positions = batch
 
                 optimizer.zero_grad()
 
                 with autocast('cuda'):
-                    loss, logits = model(
+                    loss, _, _ = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels
+                        start_positions=start_positions,
+                        end_positions=end_positions
                     )
 
                 scaler.scale(loss).backward()
@@ -355,14 +373,14 @@ def train(args):
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         logger.info(f"***** Đánh giá tập Dev (Epoch {epoch+1}) *****")
-        eval_loss, eval_acc, eval_f1 = evaluate(model, dev_dataloader, device)
+        eval_loss, eval_em, eval_f1 = evaluate(model, dev_dataloader, device)
         
-        logger.info(f"Epoch {epoch+1} - Loss: {eval_loss:.4f} - Accuracy: {eval_acc*100:.2f}% - Macro F1: {eval_f1*100:.2f}%")
+        logger.info(f"Epoch {epoch+1} - Eval Loss: {eval_loss:.4f} | Exact Match: {eval_em*100:.2f}% | Avg Span F1: {eval_f1*100:.2f}%")
 
         if eval_f1 > best_f1:
             best_f1 = eval_f1
             torch.save(model.state_dict(), best_model_path)
-            logger.info(f"✨ LƯU KỶ LỤC TỐI ƯU MỚI: Macro F1 = {best_f1*100:.2f}% tại {best_model_path}")
+            logger.info(f"✨ LƯU KỶ LỤC TỐI ƯU MỚI: Avg Span F1 = {best_f1*100:.2f}% tại {best_model_path}")
 
     # ---------------------------------------------
     # 4.2 ĐÁNH GIÁ TRÊN TẬP TEST SAU KHI TRAIN XONG
@@ -373,24 +391,24 @@ def train(args):
         logger.info("Đang nạp lại trọng số tốt nhất...")
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         
-        test_loss, test_acc, test_f1 = evaluate(model, test_dataloader, device)
+        test_loss, test_em, test_f1 = evaluate(model, test_dataloader, device)
         logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f}")
-        logger.info(f"🎯 Accuracy: {test_acc*100:.2f}%")
-        logger.info(f"🎯 Macro F1 (4 Classes): {test_f1*100:.2f}%")
+        logger.info(f"🎯 Exact Match: {test_em*100:.2f}%")
+        logger.info(f"🎯 Avg Span F1: {test_f1*100:.2f}%")
     else:
-        logger.info("⚠️ Bỏ qua bước Test.")
+        logger.info("⚠️ Bỏ qua bước Test (không tìm thấy test.json hoặc test_dataloader trống).")
     logger.info("==================================================")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True, help="Thư mục chứa train.json, dev.json, test.json")
     parser.add_argument("--init_checkpoint", type=str, required=True, help="Thư mục weights gốc")
-    parser.add_argument("--output_dir", type=str, default="./vnli_outputs", help="Thư mục lưu output")
+    parser.add_argument("--output_dir", type=str, default="./outputs_vinewsqa", help="Thư mục lưu output")
     
-    parser.add_argument("--max_seq_length", type=int, default=256, help="Độ dài tối đa của cặp câu")
+    parser.add_argument("--max_seq_length", type=int, default=384, help="Độ dài tối đa của câu")
     parser.add_argument("--train_batch_size", type=int, default=16, help="Batch size huấn luyện")
-    parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size đánh giá")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning Rate")
+    parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size đánh giá/test")
+    parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning Rate")
     parser.add_argument("--epochs", type=int, default=5, help="Số epoch")
     parser.add_argument("--seed", type=int, default=42, help="Seed ngẫu nhiên")
     

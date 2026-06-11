@@ -1,8 +1,6 @@
 import argparse
 import json
 import logging
-from logging import config
-from logging import config
 import os
 import random
 import numpy as np
@@ -24,16 +22,14 @@ logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=lo
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# THIẾT LẬP 4 NHÃN CHO VNLI (Gộp 'other' và '-')
+# THIẾT LẬP 3 NHÃN CHO VNLI (NLI Task)
 # ==========================================
 LABEL_MAP = {
     "entailment": 0,
     "neutral": 1,
-    "contradiction": 2,
-    "other": 3,
-    "-": 3       # Gộp chung các mẫu lỗi/không xác định vào nhóm 3
+    "contradiction": 2
 }
-NUM_LABELS = len(set(LABEL_MAP.values())) # Sẽ là 4 lớp
+NUM_LABELS = len(LABEL_MAP)
 
 def set_seed(seed: int):
     """Cố định seed để đảm bảo tính tái lặp"""
@@ -52,12 +48,16 @@ def set_seed(seed: int):
 # 1. KIẾN TRÚC MÔ HÌNH (SEQUENCE CLASSIFICATION)
 # ==========================================
 class ViPhonBertForSequenceClassification(nn.Module):
+    """
+    Kiến trúc ViPhonBERT cho bài toán Phân loại Cặp câu (NLI).
+    """
     def __init__(self, config, num_labels):
         super().__init__() 
         
         self.num_labels = num_labels
         self.hidden_size = config.hidden_size
         
+        # Shared Embeddings
         self.shared_embeddings = nn.Embedding(
             config.vocab_size, 
             self.hidden_size,
@@ -65,22 +65,16 @@ class ViPhonBertForSequenceClassification(nn.Module):
         )
         self.fc_emb = nn.Linear(self.hidden_size * 3, self.hidden_size)
         
+        # BERT Encoder
         self.bert = BertModel(config, add_pooling_layer=False)
         self.bert.embeddings.word_embeddings = None
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Tanh(), # Giúp mô hình học các tương tác phi tuyến tính phức tạp
-            nn.Dropout(0.15), # Tăng chút dropout để chống học vẹt
-            nn.Linear(config.hidden_size, num_labels)
-        )
+        self.classifier = nn.Linear(config.hidden_size, num_labels)
 
-        for module in self.classifier:
-            if isinstance(module, nn.Linear):
-                module.weight.data.normal_(mean=0.0, std=config.initializer_range)
-                if module.bias is not None:
-                    module.bias.data.zero_()
+        self.classifier.weight.data.normal_(mean=0.0, std=config.initializer_range)
+        if self.classifier.bias is not None:
+            self.classifier.bias.data.zero_()
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         onset_ids = input_ids[:, :, 0]
@@ -100,28 +94,14 @@ class ViPhonBertForSequenceClassification(nn.Module):
         )
 
         sequence_output = outputs.last_hidden_state
-        # --- CẢI TIẾN: Dùng Mean Pooling thay vì CLS ---
-        # Tính trung bình cộng các token, bỏ qua những token là padding (attention_mask == 0)
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(sequence_output.size()).float()
-        sum_embeddings = torch.sum(sequence_output * input_mask_expanded, 1)
-        sum_mask = input_mask_expanded.sum(1)
-        sum_mask = torch.clamp(sum_mask, min=1e-9) # Tránh chia cho 0
-        mean_pooled_output = sum_embeddings / sum_mask
+        cls_output = sequence_output[:, 0, :]
+        cls_output = self.dropout(cls_output)
         
-        # Đưa qua Dropout và Classifier
-        cls_output = self.dropout(mean_pooled_output)
         logits = self.classifier(cls_output)
 
         loss = None
         if labels is not None:
-            # 1. Khởi tạo trọng số cho các nhãn (Class Weights)
-            # Giả định Entailment, Neutral, Contradiction có trọng số 1.0
-            # Nhãn 'other' (index 3) quá ít data -> Cấp trọng số x5 hoặc x10 để ép mô hình học
-            device = logits.device
-            weights = torch.tensor([1.0, 1.0, 1.0, 5.0]).to(device) 
-            
-            # 2. Thêm Label Smoothing = 0.1 để giảm Overfitting (Hạ mức Loss 2.6 xuống)
-            loss_fct = nn.CrossEntropyLoss(weight=weights, label_smoothing=0.1)
+            loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
         return loss, logits
@@ -145,10 +125,9 @@ def load_vnli_data(data_path):
             
             if not s1 or not s2 or not label:
                 continue
-            
-            # Đã hỗ trợ nhãn other và - nên không còn cảnh báo loại bỏ nữa
+                
             if label not in LABEL_MAP:
-                logger.warning(f"Nhãn lạ '{label}' hoàn toàn chưa biết. Bỏ qua.")
+                logger.warning(f"Nhãn lạ '{label}' không có trong danh sách.")
                 continue
                 
             examples.append({
@@ -164,6 +143,8 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
     features = []
     
     for example in tqdm(examples, desc="Converting features"):
+        # Nối 2 câu lại với nhau bằng dấu gạch đứng (hoặc [SEP] tùy tokenizer)
+        # ViPhonTokenizer làm việc dựa trên âm tiết nên ta ngăn cách bằng dấu phẩy/gạch đứng
         text_pair = example["sentence_1"] + " | " + example["sentence_2"]
         label_id = example["label"]
         
@@ -237,13 +218,7 @@ def evaluate(model, dataloader, device):
     all_labels = np.array(all_labels)
     
     accuracy = np.sum(all_preds == all_labels) / len(all_labels) if len(all_labels) > 0 else 0
-    
-    # Tính Macro F1, có thể sẽ cảnh báo UndefinedMetricWarning nếu một class không bao giờ được dự đoán
-    import warnings
-    from sklearn.exceptions import UndefinedMetricWarning
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=UndefinedMetricWarning)
-        macro_f1 = f1_score(all_labels, all_preds, average='macro') if len(all_labels) > 0 else 0
+    macro_f1 = f1_score(all_labels, all_preds, average='macro') if len(all_labels) > 0 else 0
     
     return eval_loss, accuracy, macro_f1
 
@@ -277,7 +252,7 @@ def train(args):
         else:
             state_dict = torch.load(weights_path, map_location=device)
         missing_keys, _ = model.load_state_dict(state_dict, strict=False)
-        logger.info(f"Missing keys (do Classifier layer 4 nhãn): {missing_keys}")
+        logger.info(f"Missing keys (do Classifier layer): {missing_keys}")
     else:
         logger.info("❌ Không tìm thấy checkpoint. Train từ Random Initialization.")
 
@@ -322,7 +297,7 @@ def train(args):
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * t_total), num_training_steps=t_total)
     scaler = GradScaler('cuda') 
 
-    logger.info("***** Bắt đầu tiến trình Huấn luyện VNLI (4 Classes) *****")
+    logger.info("***** Bắt đầu tiến trình Huấn luyện VNLI *****")
     best_f1 = 0.0
     best_model_path = os.path.join(args.output_dir, "best_model_vnli.pt")
 
@@ -376,7 +351,7 @@ def train(args):
         test_loss, test_acc, test_f1 = evaluate(model, test_dataloader, device)
         logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f}")
         logger.info(f"🎯 Accuracy: {test_acc*100:.2f}%")
-        logger.info(f"🎯 Macro F1 (4 Classes): {test_f1*100:.2f}%")
+        logger.info(f"🎯 Macro F1: {test_f1*100:.2f}%")
     else:
         logger.info("⚠️ Bỏ qua bước Test.")
     logger.info("==================================================")

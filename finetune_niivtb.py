@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import numpy as np
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 
 import torch
@@ -197,10 +198,12 @@ def create_dataloader(features, batch_size, is_training=True):
 
 def evaluate(model, dataloader, device):
     if dataloader is None:
-        return 0, 0
+        return 0, 0, 0
     model.eval()
     eval_loss, eval_accuracy = 0, 0
     nb_eval_steps, nb_valid_tokens = 0, 0
+    all_preds = []
+    all_labels = []
 
     for batch in dataloader:
         batch = tuple(t.to(device) for t in batch)
@@ -228,10 +231,14 @@ def evaluate(model, dataloader, device):
         nb_valid_tokens += len(active_labels)
         nb_eval_steps += 1
 
+        all_preds.extend(active_preds.tolist())
+        all_labels.extend(active_labels.tolist())
+
     eval_loss = eval_loss / nb_eval_steps if nb_eval_steps > 0 else 0
     eval_accuracy = eval_accuracy / nb_valid_tokens if nb_valid_tokens > 0 else 0
+    macro_f1 = f1_score(np.array(all_labels), np.array(all_preds), average='macro', zero_division=0) if len(all_labels) > 0 else 0
     
-    return eval_loss, eval_accuracy
+    return eval_loss, eval_accuracy, macro_f1
 
 def train(args):
     set_seed(args.seed)
@@ -361,9 +368,9 @@ def train(args):
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         logger.info(f"***** Đánh giá chất lượng tập Dev (Epoch {epoch+1}) *****")
-        eval_loss, eval_acc = evaluate(model, dev_dataloader, device)
+        eval_loss, eval_acc, eval_f1 = evaluate(model, dev_dataloader, device)
         
-        logger.info(f"Epoch {epoch+1} - Eval Loss: {eval_loss:.4f} - Eval Acc (Token-level): {eval_acc*100:.2f}%")
+        logger.info(f"Epoch {epoch+1} - Eval Loss: {eval_loss:.4f} - Eval Acc (Token-level): {eval_acc*100:.2f}% - Macro F1: {eval_f1*100:.2f}%")
 
         if eval_acc > best_acc:
             best_acc = eval_acc
@@ -377,8 +384,8 @@ def train(args):
         logger.info("Đang nạp lại trọng số tốt nhất từ quá trình huấn luyện...")
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         
-        test_loss, test_acc = evaluate(model, test_dataloader, device)
-        logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f} - Accuracy (Token-level): {test_acc*100:.2f}%")
+        test_loss, test_acc, test_f1 = evaluate(model, test_dataloader, device)
+        logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f} - Accuracy (Token-level): {test_acc*100:.2f}% - Macro F1: {test_f1*100:.2f}%")
     else:
         logger.info("⚠️ Bỏ qua bước Test (không tìm thấy test.json hoặc model chưa được lưu).")
     logger.info("==================================================")

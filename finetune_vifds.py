@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import numpy as np
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 
 import torch
@@ -245,7 +246,10 @@ def evaluate(model, dataloader, device):
     # 2. Strict Sentence Accuracy (Đúng tuyệt đối cả 10 khía cạnh trong câu)
     strict_acc = np.sum(np.all(all_preds == all_labels, axis=1)) / all_labels.shape[0]
     
-    return eval_loss, aspect_acc, strict_acc
+    # 3. Macro F1 trên tất cả các dự đoán khía cạnh
+    macro_f1 = f1_score(all_labels.flatten(), all_preds.flatten(), average='macro', zero_division=0) if all_labels.size > 0 else 0
+    
+    return eval_loss, aspect_acc, strict_acc, macro_f1
 
 
 # ==========================================
@@ -364,9 +368,9 @@ def train(args):
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         logger.info(f"***** Đánh giá tập Dev (Epoch {epoch+1}) *****")
-        eval_loss, aspect_acc, strict_acc = evaluate(model, dev_dataloader, device)
+        eval_loss, aspect_acc, strict_acc, eval_f1 = evaluate(model, dev_dataloader, device)
         
-        logger.info(f"Epoch {epoch+1} - Loss: {eval_loss:.4f} - Aspect Acc: {aspect_acc*100:.2f}% - Strict Sentence Acc: {strict_acc*100:.2f}%")
+        logger.info(f"Epoch {epoch+1} - Loss: {eval_loss:.4f} - Aspect Acc: {aspect_acc*100:.2f}% - Strict Sentence Acc: {strict_acc*100:.2f}% - Macro F1: {eval_f1*100:.2f}%")
 
         # Ta dùng Aspect-level Accuracy làm tiêu chí đánh giá mô hình tốt nhất
         if aspect_acc > best_acc:
@@ -383,10 +387,11 @@ def train(args):
         logger.info("Đang nạp lại trọng số tốt nhất từ quá trình huấn luyện...")
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         
-        test_loss, t_aspect_acc, t_strict_acc = evaluate(model, test_dataloader, device)
+        test_loss, t_aspect_acc, t_strict_acc, t_f1 = evaluate(model, test_dataloader, device)
         logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f}")
         logger.info(f"🎯 Aspect-level Accuracy: {t_aspect_acc*100:.2f}% (Chính xác khía cạnh độc lập)")
         logger.info(f"🎯 Strict Sentence Accuracy: {t_strict_acc*100:.2f}% (Đúng toàn bộ 10 khía cạnh trong 1 câu)")
+        logger.info(f"🎯 Macro F1: {t_f1*100:.2f}%")
     else:
         logger.info("⚠️ Bỏ qua bước Test (không tìm thấy test.json hoặc model chưa được lưu).")
     logger.info("==================================================")

@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import numpy as np
+from sklearn.metrics import f1_score
 from tqdm import tqdm
 
 import torch
@@ -208,12 +209,13 @@ def evaluate(model, dataloader, device):
 
     eval_loss = eval_loss / nb_eval_steps if nb_eval_steps > 0 else 0
     
-    # Tính Accuracy
+    # Tính Accuracy và Macro F1
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     accuracy = np.sum(all_preds == all_labels) / len(all_labels) if len(all_labels) > 0 else 0
+    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) if len(all_labels) > 0 else 0
     
-    return eval_loss, accuracy
+    return eval_loss, accuracy, macro_f1
 
 
 # ==========================================
@@ -344,9 +346,9 @@ def train(args):
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         logger.info(f"***** Đánh giá tập Dev (Epoch {epoch+1}) *****")
-        eval_loss, eval_acc = evaluate(model, dev_dataloader, device)
+        eval_loss, eval_acc, eval_f1 = evaluate(model, dev_dataloader, device)
         
-        logger.info(f"Epoch {epoch+1} - Eval Loss: {eval_loss:.4f} - Eval Accuracy: {eval_acc*100:.2f}%")
+        logger.info(f"Epoch {epoch+1} - Eval Loss: {eval_loss:.4f} - Eval Accuracy: {eval_acc*100:.2f}% - Macro F1: {eval_f1*100:.2f}%")
 
         if eval_acc > best_acc:
             best_acc = eval_acc
@@ -363,8 +365,8 @@ def train(args):
         logger.info("Đang nạp lại trọng số tốt nhất từ quá trình huấn luyện...")
         model.load_state_dict(torch.load(best_model_path, map_location=device))
         
-        test_loss, test_acc = evaluate(model, test_dataloader, device)
-        logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f} - Accuracy: {test_acc*100:.2f}%")
+        test_loss, test_acc, test_f1 = evaluate(model, test_dataloader, device)
+        logger.info(f"🎯 KẾT QUẢ TEST CUỐI CÙNG - Loss: {test_loss:.4f} - Accuracy: {test_acc*100:.2f}% - Macro F1: {test_f1*100:.2f}%")
     else:
         logger.info("⚠️ Bỏ qua bước Test (không tìm thấy test.json hoặc model chưa được lưu).")
     logger.info("==================================================")
